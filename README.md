@@ -1,6 +1,6 @@
 # What Makes a YouTube Video Trend?
 
-A multi-method statistical analysis of **180,000+ YouTube trending-video records** across five countries, using regression, classification, and hypothesis testing to identify what drives a video onto — and keeps it on — YouTube's trending page.
+A multi-method statistical analysis of **200,000+ YouTube trending-video records** across five countries, using regression, classification, and hypothesis testing to identify what drives a video onto — and keeps it on — YouTube's trending page.
 
 ## Overview
 
