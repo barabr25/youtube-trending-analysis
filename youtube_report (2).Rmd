@@ -1,0 +1,341 @@
+---
+title: "What Makes a YouTube Video Trend?"
+author: |
+  | Sri Krishanu Ramadhenu, Nikhil Karthikeyan
+  | Dayaabaran Ragunathan, Karthik Ravi
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 12pt
+mainfont: "Times New Roman"
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/baran/Downloads/archive")
+# Set echo=TRUE here to show code, FALSE to hide it
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 6, fig.height = 3.2)
+```
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(jsonlite)
+library(GGally)
+library(MASS)
+library(skimr)
+library(scales)
+library(gridExtra)
+library(lubridate)
+library(e1071)
+library(knitr)
+select <- dplyr::select
+```
+
+```{r load-data, include=FALSE}
+# -------------------------------------------------------
+# Put the 5 CSVs + US_category_id.json in the same folder
+# as this .Rmd, then knit. No working-directory line needed.
+# -------------------------------------------------------
+us <- read_csv("USvideos.csv", show_col_types = FALSE)
+gb <- read_csv("GBvideos.csv", show_col_types = FALSE)
+ca <- read_csv("CAvideos.csv", show_col_types = FALSE)
+de <- read_csv("DEvideos.csv", show_col_types = FALSE)
+fr <- read_csv("FRvideos.csv", show_col_types = FALSE)
+
+cat_json   <- fromJSON("US_category_id.json")
+categories <- tibble(
+  category_id = as.integer(cat_json$items$id),
+  category    = cat_json$items$snippet$title
+)
+
+all_data <- bind_rows(
+  us %>% mutate(country = "US"),
+  gb %>% mutate(country = "GB"),
+  ca %>% mutate(country = "CA"),
+  de %>% mutate(country = "DE"),
+  fr %>% mutate(country = "FR")
+) %>%
+  left_join(categories, by = "category_id") %>%
+  mutate(
+    trending_date = ymd(trending_date),
+    publish_time  = ymd_hms(publish_time),
+    log_views     = log1p(views),
+    log_likes     = log1p(likes),
+    log_dislikes  = log1p(dislikes),
+    log_comments  = log1p(comment_count)
+  )
+
+video_level <- all_data %>%
+  group_by(video_id, country) %>%
+  summarise(
+    trend_days     = n_distinct(trending_date),
+    first_views    = first(views),
+    first_likes    = first(likes),
+    first_dislikes = first(dislikes),
+    first_comments = first(comment_count),
+    category       = first(category),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    log_first_views    = log1p(first_views),
+    log_first_likes    = log1p(first_likes),
+    log_first_dislikes = log1p(first_dislikes),
+    log_first_comments = log1p(first_comments),
+    trending_3plus     = as.factor(ifelse(trend_days >= 3, 1, 0))
+  )
+```
+
+# Executive Summary
+
+YouTube's trending page surfaces up to 200 videos from each country per day. This makes it a very high visibility target for creators and marketers. However, the platform doesn't show what drives a video on the platform or what keeps it in the algorithm. This project treats trending as a measurable outcome and will ask two central questions,which engagement metrics are most associated with trending performance and whether that varies by content category, and whether first-day engagement can predict how long a video stays trending. We will use daily trending data from 5 different countries collected from 2017 to 2018. There are roughly 200,000 rows in total which are aggregated to the video level to avoid counting the same video on multiple days.
+
+For Q1, a multiple linear regression on a log-transformed US data will explain about 81% of the variation in log(views). The strongest predictors are log(dislikes) and log(likes) and both carry a very equal weight. Comments add almost nothing when the other metrics are included. Content category matters regardless of engagement for example, Autos & Vehicles and Sports videos draw higher views than the Entertainment baseline, while Howto & Style and Nonprofits & Activism draw fewer. Music videos score below the baseline if the engagement is held constant which shows their success is driven by raw engagement instead of the category.
+
+For Q2 a logistic regression that predicts whether the video trends for 3 or more days shows a 92% accuracy but this is inflated by class imbalance since most videos trend only briefly and the model identifies about 28% of the long-trending videos. A negative binomial regression on the trend duration shows that first day likes are the most strongest engagement signal of staying trending. The most surprising result from the Q2 model is that country effects actually control every engagement metric. The videos from Great Britain and U.S do trend much longer then those from Germany and France but not cause of early engagement. 
+
+Putting them together, the results show that early engagement volume is important but a limited signal of trending long term and the platform behavior will differ according to country. These conclusions are only for the period November 2017 - June 2018, which is a 7-month period and it cannot be used to generalize all of YouTube's videos or the platform's current algorithm. 
+
+# Project Background and Goals
+
+YouTube is the absolute largest video-sharing platform in the entire world, with hundreds on top of hundreds of content uploaded. Among the various ways content appears the trending page is the most visible. It shows 200 videos per country each day, which is selected by an algorithm that YouTube does not reveal to the public. For creators and marketers getting on that trending page can result in millions of more views and the question is what gets a video there and what keeps it there as well.
+
+The challenge is that the trending algorithm is very hidden to the public. YouTube has said that the trending page reflects a mix of view count, growth rate, engagement, and video age, but the relative weight of these factors are not revealed to the public. It is also not obvious if these factors matter across content categories or different countries. The project will treat the trending page as something that can be measured and will use video characteristics, engagement metrics, content category, and country to fond what is causing videos to show up on on the trending page and keeping them there. 
+
+We will analyze trending snapshots from five different countries (United States, Great Britain, Canada, Germany, and France) which was collected from November 2017 to June 2018. Although the same video can appear on the trending list multiple times we aggregate the data to the video level to see how strongly a video trends and how long its on a the trending page. Our main goal is to find which video characteristics most relate to getting videos on the trending page and also test if those patterns are consistent across countries and categories. The two questions we will ask:
+
+Q1: Which engagement metrics are most associated with trending performance, and does this relationship vary by content category?
+
+Q2: Can early engagement statistics predict how many days a video remains on the trending list?
+
+# Data Description
+
+The data for this project comes from the Trending YouTube Video Statistics dataset published on Kaggle by user datasnaek. It was first from YouTube’s Data API. This records daily snapshots of each country’s trending page from November 2017 to June 2018, with around 200 videos logged per day. There are five countries: the United States, Great Britain, Canada, Germany, and France, which together comprise 200,000 rows. Each row is a video from a single trending day, even if a video trends for multiple days. 
+
+Each record has a video identifier, the trending date, channel, and title text, a numeric category ID, publish time, and the four engagement metrics, which are very important to our questions. A companion JSON file maps the numeric category IDs to readable labels, which we will join to the main dataset so that categories can be analyzed by name. 
+
+Before any modeling, we checked the data for missing values across the 5 key metrics and were not able to find any, so there was no need to drop rows. The summary statistic table made the main features of the data very clear, which was that all four engagement metrics are heavily right-skewed. For U.S trending videos, the mean number of views sits far above the median, and the same gap shows up for likes, dislikes, and comments, with skewness values ranging from roughly 11 to 40. This happens because a small number of viral videos with very high engagement pull the data to the right. The side-by-side histograms of raw vs log show this. We applied a log transformation before modeling the data so that we could stabilize the variance and keep the zero values.
+
+The content categories are also more spread than balanced. The bar chart of the top eight US categories shows that Entertainment and Music control most of the trending page, followed by HowTo and Comedy, and everything else is behind. Entertainment is a natural reference category for the regression models. The pairwise plot of the log-transformed metrics shows strong positive correlations across all the main metrics. This collinearity was expected since high views will result in more likes, comments, and dislikes. 
+
+```{r summary-stats}
+us_stats <- us %>%
+  select(views, likes, dislikes, comment_count) %>%
+  rename(comments = comment_count) %>%   # avoids underscore collision in pivot
+  summarise(across(everything(), list(
+    Mean   = ~round(mean(., na.rm = TRUE), 0),
+    Median = ~round(median(., na.rm = TRUE), 0),
+    SD     = ~round(sd(., na.rm = TRUE), 0),
+    Skew   = ~round(e1071::skewness(., na.rm = TRUE), 2)
+  ))) %>%
+  pivot_longer(everything(), names_to = c("Variable", "Stat"), names_sep = "_") %>%
+  pivot_wider(names_from = Stat, values_from = value)
+
+kable(us_stats, caption = "Summary statistics for US trending videos (raw counts)")
+```
+
+```{r missing-data}
+all_data %>%
+  summarise(across(c(views, likes, dislikes, comment_count, category), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing Count") %>%
+  kable(caption = "Missing value counts across all countries")
+```
+
+```{r dist-plots, fig.cap="Raw (left) and log-transformed (right) distribution of US views"}
+p1 <- ggplot(us, aes(x = views)) +
+  geom_histogram(bins = 60, fill = "#e63946", color = "white", alpha = 0.8) +
+  scale_x_continuous(labels = label_number(scale = 1e-6, suffix = "M")) +
+  labs(title = "Views (raw)", x = "Views", y = "Count") + theme_minimal()
+p2 <- ggplot(us, aes(x = log1p(views))) +
+  geom_histogram(bins = 60, fill = "#457b9d", color = "white", alpha = 0.8) +
+  labs(title = "log(Views + 1)", x = "log(Views + 1)", y = "Count") + theme_minimal()
+grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r category-bar, fig.cap="Top 8 content categories in US trending videos"}
+all_data %>%
+  filter(country == "US", !is.na(category)) %>%
+  count(category, sort = TRUE) %>%
+  slice_head(n = 8) %>%
+  ggplot(aes(x = reorder(category, n), y = n)) +
+  geom_col(fill = "#2a9d8f", alpha = 0.85) + coord_flip() +
+  scale_y_continuous(labels = label_comma()) +
+  labs(title = "Top 8 Categories - US", x = NULL, y = "Trending Appearances") +
+  theme_minimal()
+```
+
+```{r ggpairs, fig.cap="Pairwise relationships among log-transformed engagement metrics (US)", fig.height=3.8, fig.width=6}
+us %>%
+  mutate(log_views = log1p(views), log_likes = log1p(likes),
+         log_dislikes = log1p(dislikes), log_comments = log1p(comment_count)) %>%
+  select(log_views, log_likes, log_dislikes, log_comments) %>%
+  sample_n(5000) %>%
+  ggpairs(columnLabels = c("log(views)", "log(likes)", "log(dislikes)", "log(comments)"),
+          upper = list(continuous = wrap("cor", size = 3)),
+          lower = list(continuous = wrap("points", alpha = 0.1, size = 0.5)),
+          diag  = list(continuous = wrap("densityDiag", fill = "#457b9d", alpha = 0.5))) +
+  theme_minimal(base_size = 9)
+```
+
+# Methodology
+
+In order to assess the factors that drive Youtube video trending length and performance, our analysis is formed based on two research questions that include categorical, linear, and count data methods as well.
+
+First, we will use MLR (Multiple Linear Regression) to identify the specific engagement metrics that are most associated with the popularity of a video in its trending cycle. Specifically, engagement metrics such as likes, dislikes, views, and amount of comments all show a heavily right-skewed distribution that spans over multiple orders. In order to satisfy the assumptions of normality of the residuals and homoscedasticity for linear modeling, we will apply a natural log transformation (log(x+1)) which will effectively handle the zero values. We will identify the baseline model as log(views) = beta_0 + beta_1 log(likes) + beta_2 log(dislikes) + beta_3 log(comments) + sum of category(i) + error term. Entertainment is established as the referenced category since it represents the greatest market share baseline of trending videos. This makes it so we can measure if certain genres from a baseline standpoint can generate different levels of views compared to just general entertainment when we are controlling for the raw engagement from the audience.
+
+In order to correctly analyze what actually keeps a video in its trending cycle based on its initial traction, we have to combine daily logs to individual profiles (we call this video_level) and draw out the observed first day engagement signals that are present. There are two statistical lenses that we analyzed duration through. The first includes binary classification through logistic regression. A classify a long-trending video as one that is on the trending page for at least 3 days (trending_plus = 1). The logistic regression model uses the first day log-transformed engagement as well as geographic indicators (country) to then predict the probability of a video that falls in this category. It is modeled as log(p/(1-p)) = beta_0 + beta_1 log(first_views) + beta_2 log(first_likes) + beta_3 log(first_dislikes) + beta_4 log(first_comments) + Country. The second method uses negative binomial (NB) regression to apply count data modeling. Since the exact duration that a video trends represents the overly-varied count data where the variance heavily exceeds the mean, the standard Poisson regression isn’t appropriate for this. We then use the negative binomial model to introduce a dispersion parameter (theta) to correctly map the skewed distribution of sustained traction.
+
+To test if regional algorithms are different in audience scale and content distribution, we run two comparative analyses across the nations. We conduct a one way ANOVA test in order to check for statistically significant differences in average log(views) amongst the five nations. We also run the Pearson’s Chi-Square test of independence on a contingency table of category counts by nation. This is to assess if regional trending feeds are populated by different distributions of content genres.
+
+
+# Analysis and Findings
+
+This section presents the results of our three models and two comparative tests. Section 5.1 addresses Q1 using multiple linear regression. Sections 5.2 and 5.3 address Q2 through logistic regression on the 3+ day trending outcome and negative binomial regression on trend duration. Section 5.4 compares engagement levels and content composition across the five countries.
+
+## Q1: Engagement Metrics and Category Variation
+
+The multiple linear regression model of log-transformed U.S. views was able to produce an adjusted R^2 of .811. Therefore, this model accounts for approximately 81% of the variance in view counts based on just engagement metrics and content category.
+Both log(likes) (Beta = .389) and log(dislikes) (Beta = .417) were both very likely and statistically significant (p < .001) as predictors of engagement among the engagement predictors, having roughly equal influence. Therefore, it appears that the current trending YouTube algorithm is primarily concerned with the total volume of engagement for a video whether it be positive or negative. Thusly, negative controversy can provide the exact same amount of "boost" to visibility as positive engagement. When controlling for likes and dislikes; however, log(comments) tends toward 0. Therefore, while there may be some additional predictive power provided by the sheer volume of comments, it is relatively minimal.
+
+As indicated earlier, content category has large effects on the position relative to the entertainment baseline. Two categories exhibit large positive coefficients above the entertainment baseline - Sports and Autos & Vehicles - indicating that in absolute terms, regardless of how many engagements occur, videos in these subject areas will start at a higher engagement rate. These subject areas reflect viewing behavior which is generally characterized as passive where little or no interaction occurs with the video itself. Categories such as Howto & Style and Nonprofits & Activism exhibit negative coefficients, indicating that they have lower engagement rates than similar categories. While music videos exhibit a strong negative relationship with entertainment when controlling for engagement, it indicates another trend: music videos do not trend due to any category level algorithmic advantage. Rather, their engagement is so high that even though they receive a category penalty, they are able to overcome it through their overall engagement levels.
+
+```{r mlr-model}
+model_data <- all_data %>%
+  filter(country == "US", !is.na(category)) %>%
+  select(log_views, log_likes, log_dislikes, log_comments, category) %>%
+  drop_na() %>%
+  mutate(category = relevel(factor(category), ref = "Entertainment"))
+
+mlr_fit <- lm(log_views ~ log_likes + log_dislikes + log_comments + category,
+              data = model_data)
+
+as.data.frame(summary(mlr_fit)$coefficients) %>%
+  rownames_to_column("Term") %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = paste0("MLR coefficients (US, ref: Entertainment). Adj R-squared = ",
+                         round(summary(mlr_fit)$adj.r.squared, 3)))
+```
+
+```{r mlr-diagnostics, fig.cap="Residual diagnostics for the MLR model", fig.height=3.2}
+par(mfrow = c(1, 2))
+plot(mlr_fit, which = c(1, 2), cex = 0.3, col = rgb(0,0,0,0.2))
+par(mfrow = c(1, 1))
+```
+
+## Q2a: Logistic Regression - Predicting 3+ Trending Days
+
+The logistic regression model was created with first day engagement data (likes/dislikes/views) and country data as inputs to determine how many days a video will stay on the trending page; specifically whether the video stays trending for three days or longer. The model produced a raw accuracy of 92.4% when evaluated against the test dataset. While this appears to be a very good result, it is primarily due to an inflationary effect caused by class imbalance. Since most of the time, videos do not trend for three or more days, there are no other predictions to consider besides the majority category, which generally produces higher than average accuracy levels.
+
+There is one area where the model clearly has a major issue based upon the confusion matrix. Namely, the model accurately predicts long-trending videos only 28.3% of the time and demonstrates low sensitivity. The model takes a conservative approach and predicts most videos as trending for a short period of time and misses identifying many videos that could have been successful. Therefore, it appears that only a portion of all factors contributing to trending longevity are captured within the first day’s activity. Social media spillovers, timing related to new cycles of events/news, and additional potential promotional opportunities through the algorithm contribute significantly to a video trending longer than initially anticipated – none of which were included within the provided feature sets.
+
+Both First Day Likes and First Day Dislikes show a statistically significant positive association with the probability of trending for 3+ days. These findings confirm what was identified in Q1. Specifically, the algorithm is examining both volume counts for positive and negative sentiments. However, since the coefficient of First Day Views is slightly negative relative to First Day Likes and Dislikes (as would be expected), it is probable that the slight negative relationship is a product of multicollinearity and not an actual suppressive relationship.
+
+
+```{r logit-model}
+set.seed(42)
+logit_data <- video_level %>%
+  filter(!is.na(category)) %>%
+  select(trending_3plus, log_first_views, log_first_likes,
+         log_first_dislikes, log_first_comments, country) %>%
+  drop_na()
+
+train_idx  <- sample(nrow(logit_data), 0.8 * nrow(logit_data))
+train_data <- logit_data[train_idx, ]
+test_data  <- logit_data[-train_idx, ]
+
+logit_fit <- glm(trending_3plus ~ log_first_views + log_first_likes +
+                   log_first_dislikes + log_first_comments + country,
+                 data = train_data, family = binomial)
+
+as.data.frame(summary(logit_fit)$coefficients) %>%
+  rownames_to_column("Term") %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Logistic regression coefficients (3+ trending days)")
+```
+
+```{r confusion-matrix}
+pred_prob  <- predict(logit_fit, newdata = test_data, type = "response")
+pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+conf_mat   <- table(Predicted = pred_class, Actual = test_data$trending_3plus)
+accuracy   <- mean(pred_class == as.integer(as.character(test_data$trending_3plus)))
+
+kable(conf_mat, caption = paste0("Confusion matrix (test set). Accuracy = ",
+                                 round(accuracy * 100, 1), "%"))
+```
+
+## Q2b: Negative Binomial Regression - Trend Duration
+
+The negative binomial regression models the trend duration as a count variable, representing the number of days that each video was present on the trending list. While a Poisson model could have been used to model this variable, the value of the dispersion parameter of theta (estimated at around 147.5) indicates that there is overdispersion in the variable, justifying its use in a negative binomial model. Furthermore, among the variables related to the number of likes, comments, dislikes and views that the videos received on their first day of publication, the variable with the largest and most statistically significant coefficient is the logarithm of the number of likes (with a coefficient of 0.040 and a p-value of less than 0.001). The variables for the logarithm of the number of comments (with a coefficient of 0.008 and a p-value of less than 0.001) and the logarithm of the number of dislikes (with a coefficient of 0.007 and a p-value of 0.030) are also positively associated with the trend duration of a given video. Finally, the logarithm of the number of views for a video had a small positive coefficient (of 0.007 with a p-value of 0.031), but nearly zero compared to the variable for the number of likes. Thus, overall engagement with the video that indicates that audiences like the video has a greater impact upon its trending than the number of views that the video receives. Perhaps the most important finding of this negative binomial model, however, relates to the countries from which the videos originated. For instance, videos from Great Britain were found to have a much longer trend duration relative to Canada (with a coefficient of 1.386 and a p-value of less than 0.001), followed by videos from the United States (with a coefficient of 0.905 and a p-value of less than 0.001). However, videos from Germany and France had negative coefficients relative to Canada (their coefficients were −0.042 and −0.031, respectively), indicating that these videos were not as likely to remain on the trending list. Thus, these results indicate that factors related to the countries from which the videos were published have a greater impact upon the trend duration of the videos than factors related to the initial engagement with the videos when they were published.
+
+```{r nb-model}
+nb_data <- video_level %>%
+  filter(!is.na(category)) %>%
+  select(trend_days, log_first_views, log_first_likes,
+         log_first_dislikes, log_first_comments, country) %>%
+  drop_na()
+
+nb_fit <- glm.nb(trend_days ~ log_first_views + log_first_likes +
+                   log_first_dislikes + log_first_comments + country, data = nb_data)
+
+as.data.frame(summary(nb_fit)$coefficients) %>%
+  rownames_to_column("Term") %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = paste0("Negative binomial coefficients (trend duration). Theta = ",
+                         round(nb_fit$theta, 1)))
+```
+
+## Cross-Country Comparisons
+
+To complement the model-based findings from Q2, we ran two statistical tests to determine whether videos that trend on these pages exhibit differences across countries in their engagement with those videos and their content. The one-way analysis of variance model for log(views) according to country demonstrates a statistically significant difference in the view counts of trending videos across these five countries (F = 15,820.08, df = 4, 202305, p < 2e-16). The boxplot that accompanies this test indicates that Great Britain and the United States exhibit higher median log(views) than Canada, France, and Germany; Canada has view counts that fall somewhere in the middle of these countries. Furthermore, the differences between these count statistics for each country are generally consistent with the country coefficients that were estimated in the negative binomial model (GB β = 1.386, US β = 0.905, DE β = −0.042, FR β = −0.031). Countries that exhibit higher counts of views for their trending videos also have videos that remain trending for longer periods of time. Additionally, the Pearson's chi-squared test of the video category distribution models for each country yields a statistically significant result (χ² = 29,599.90, df = 68, p < 2.2e-16). The heatmap that visualizes the percentage of videos of each category within each country indicates that the most prominent difference between countries is exhibited by Great Britain - the percentage of trending videos that are musical videos in Great Britain far exceeds the percentage of musical videos in the remaining four countries. Videos in the Entertainment category are the most prominent in Germany and Canada, while videos with Comedy as their main category are relatively more prominent in the United States than in any of the other countries. Videos of the Sports category are more prominent in France than in the other English-speaking countries. These results help to confirm that each of these trending video pages reflects the tastes of the regions for which they are popular rather than simply the result of differences in the size of their populations and the number of views that their videos receive.
+
+```{r anova}
+aov_fit <- aov(log_views ~ country, data = all_data)
+kable(round(summary(aov_fit)[[1]], 4), caption = "One-way ANOVA: log(views) by country")
+```
+
+```{r country-boxplot, fig.cap="log(views) across five countries"}
+all_data %>%
+  ggplot(aes(x = country, y = log_views, fill = country)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "log(Views) by Country", x = "Country", y = "log(Views + 1)") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+```{r chisq}
+cat_country <- all_data %>%
+  filter(!is.na(category)) %>%
+  count(country, category) %>%
+  pivot_wider(names_from = country, values_from = n, values_fill = 0) %>%
+  column_to_rownames("category")
+
+chi_result <- suppressWarnings(chisq.test(cat_country))
+data.frame(
+  Statistic = round(chi_result$statistic, 1),
+  df        = chi_result$parameter,
+  p_value   = format.pval(chi_result$p.value, eps = 2e-16)
+) %>%
+  kable(row.names = FALSE, caption = "Chi-square test: category distribution by country")
+```
+
+```{r heatmap, fig.cap="Category share by country", fig.height=3.8}
+all_data %>%
+  filter(!is.na(category),
+         !category %in% c("Movies", "Trailers", "Shows")) %>%
+  count(country, category) %>%
+  group_by(country) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = country, y = category, fill = pct)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "#e63946", labels = percent) +
+  labs(title = "Category Share by Country", x = "Country", y = NULL, fill = "Share") +
+  theme_minimal(base_size = 9)
+```
+\newpage
+# Conclusions
+
+This project set out to answer two questions: which engagement metrics are most associated with trending performance, and whether first-day engagement can predict how long a video stays on the trending list. Across three models and two comparative analyses, several consistent patterns emerged. On Q1, the MLR confirms that both likes and dislikes are roughly equally strong predictors of view counts (β ≈ 0.39 and 0.42 respectively), while comment volume adds almost no additional explanatory power once the other metrics are included. This supports the statement that the trending channel utilizes the total engagement (regardless of sentiment) to determine which videos to feature. Furthermore, the categories of videos also have an impact upon the number of views each receives independently of engagement metrics. Videos in the Sports and Autos & Vehicles categories receive the most views, while videos in the Nonprofits & Activism and Howto & Style categories require more interactions to receive the same number of views as the more popular categories. These factors together account for 81.1% of the total variation in the number of views that videos receive. Furthermore, each of the models indicates that the engagement metrics of videos during the first day of their release can help to indicate whether videos will continue to trend beyond that first day. In both the logistic and negative binomial models, the number of likes that a video receives on the first day is the most powerful predictor of whether it will trend for a long period of time. However, the sensitivity of the logistic model to these metrics indicates that it is a poor indicator of long-term trending for videos on YouTube channels. Additionally, the coefficients for individual countries within the negative binomial model indicate some surprising results: videos from Great Britain and the United States are more likely to trend for longer periods of time than videos from Germany and France, even with identical engagement metrics. Furthermore, analyses comparing videos from these individual countries indicates that they exhibit differences in the videos that trend within each of these regions. For instance, the trending videos page for Great Britain is dominated by music videos, whereas entertainment videos are more popular in Germany and Canada. These results are meaningful for individuals who wish to target individuals within a specific region of YouTube’s platform.
+ Several limitations apply. The data covers only November 2017 to June 2018, so conclusions cannot be generalized to YouTube's current algorithm, which has undergone substantial changes since then. The dataset also captures only videos that have already reached the trending page, so we cannot speak to what prevents a video from trending in the first place. Finally, the class imbalance in trend duration (most videos trend for just one day) limits the predictive power of our classification model and would likely benefit from resampling methods such as SMOTE in future work.
+
